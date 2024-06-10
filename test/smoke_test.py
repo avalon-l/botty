@@ -1,6 +1,10 @@
+from version import __version__
 from logger import Logger
+from game_stats import GameStats
 from bot import Bot
-
+import template_finder
+from mocks.screen_mock import ScreenMock
+import utils.download_test_assets # downloads assets if they don't already exist, doesn't need to be called
 
 class TestSmoke:
     """
@@ -11,4 +15,6 @@ class TestSmoke:
         Logger.remove_file_logger()
 
     def test_smoke(self):
-        bot = Bot()
+        screen = ScreenMock("test/assets/hero_select.png")
+        game_stats = GameStats()
+        bot = Bot(game_stats)

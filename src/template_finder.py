@@ -1,255 +1,322 @@
 import cv2
-from enum import Enum
-from screen import Screen
-from typing import Tuple, Union, List
+import threading
+from screen import convert_screen_to_monitor, grab
+from dataclasses import dataclass
 import numpy as np
 from logger import Logger
 import time
 import os
 from config import Config
+from utils.misc import cut_roi, load_template, list_files_in_folder, alpha_to_mask, roi_center, color_filter, mask_by_roi
+from functools import cache
+
+templates_lock = threading.Lock()
+
+@dataclass
+class Template:
+    name: str = None
+    img_bgra: np.ndarray = None
+    img_bgr: np.ndarray = None
+    img_gray: np.ndarray = None
+    alpha_mask: np.ndarray = None
+
+@dataclass
+class TemplateMatch:
+    name: str = None
+    score: float = -1.0
+    center: tuple[int, int] = None
+    center_monitor: tuple[int, int] = None
+    region: list[float] = None
+    region_monitor: list[float] = None
+    valid: bool = False
 
 
-def load_template(path, scale_factor):
-    if os.path.isfile(path):
-        template_img = cv2.imread(path)
-        template_img = cv2.resize(template_img, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_NEAREST)
-        return template_img
-    return None
+TEMPLATE_PATHS = [
+    "assets\\templates",
+    "assets\\npc",
+    "assets\\shop",
+    "assets\\item_properties",
+    "assets\\chests",
+    "assets\\gamble",
+]
 
-class TemplateFinder:
-    def __init__(self, screen: Screen, scale_factor: float = None):
-        """
-        :param screen: Screen object
-        :param scale_factor: Scale factor that is used for templates. Note: UI and NPC templates will always have scale of 1.0
-        """
-        self.last_score = -1.0
-        self._screen = screen
-        self._config = Config()
-        if scale_factor is None:
-            scale_factor = 0.7 if self._config.general['res'] == "1920_1080" else 1.0
-        self._scale_factor = scale_factor
-        res_str = "" if self._config.general['res'] == "1920_1080" else "_1280_720"
-        self._templates = {
-            # Templates for node in A5 Town
-            "A5_TOWN_0": [load_template(f"assets/templates{res_str}/a5_town/a5_town_0.png", self._scale_factor), self._scale_factor],
-            "A5_TOWN_0.5": [load_template(f"assets/templates{res_str}/a5_town/a5_town_0.5.png", self._scale_factor), self._scale_factor],
-            "A5_TOWN_1": [load_template(f"assets/templates{res_str}/a5_town/a5_town_1.png", self._scale_factor), self._scale_factor],
-            "A5_TOWN_2": [load_template(f"assets/templates{res_str}/a5_town/a5_town_2.png", self._scale_factor), self._scale_factor],
-            "A5_TOWN_3": [load_template(f"assets/templates{res_str}/a5_town/a5_town_3.png", self._scale_factor), self._scale_factor],
-            "A5_TOWN_4": [load_template(f"assets/templates{res_str}/a5_town/a5_town_4.png", self._scale_factor), self._scale_factor],
-            "A5_TOWN_5": [load_template(f"assets/templates{res_str}/a5_town/a5_town_5.png", self._scale_factor), self._scale_factor],
-            "A5_TOWN_6": [load_template(f"assets/templates{res_str}/a5_town/a5_town_6.png", self._scale_factor), self._scale_factor],
-            "A5_TOWN_7": [load_template(f"assets/templates{res_str}/a5_town/a5_town_7.png", self._scale_factor), self._scale_factor],
-            "A5_TOWN_8": [load_template(f"assets/templates{res_str}/a5_town/a5_town_8.png", self._scale_factor), self._scale_factor],
-            "A5_TOWN_9": [load_template(f"assets/templates{res_str}/a5_town/a5_town_9.png", self._scale_factor), self._scale_factor],
-            "A5_TOWN_10": [load_template(f"assets/templates{res_str}/a5_town/a5_town_10.png", self._scale_factor), self._scale_factor],
-            # Templates for nod at Pindle
-            "PINDLE_0": [load_template(f"assets/templates{res_str}/pindle/pindle_0.png", self._scale_factor), self._scale_factor],
-            "PINDLE_1": [load_template(f"assets/templates{res_str}/pindle/pindle_1.png", self._scale_factor), self._scale_factor],
-            "PINDLE_2": [load_template(f"assets/templates{res_str}/pindle/pindle_2.png", self._scale_factor), self._scale_factor],
-            "PINDLE_3": [load_template(f"assets/templates{res_str}/pindle/pindle_3.png", self._scale_factor), self._scale_factor],
-            "PINDLE_4": [load_template(f"assets/templates{res_str}/pindle/pindle_4.png", self._scale_factor), self._scale_factor],
-            "PINDLE_5": [load_template(f"assets/templates{res_str}/pindle/pindle_5.png", self._scale_factor), self._scale_factor],
-            "PINDLE_6": [load_template(f"assets/templates{res_str}/pindle/pindle_6.png", self._scale_factor), self._scale_factor],
-            "PINDLE_7": [load_template(f"assets/templates{res_str}/pindle/pindle_7.png", self._scale_factor), self._scale_factor],
-            # Templates for nodes to Eldritch
-            "ELDRITCH_START": [load_template(f"assets/templates{res_str}/eldritch/eldritch_start.png", self._scale_factor), self._scale_factor],
-            "ELDRITCH_0": [load_template(f"assets/templates{res_str}/eldritch/eldritch_0.png", self._scale_factor), self._scale_factor],
-            "ELDRITCH_1": [load_template(f"assets/templates{res_str}/eldritch/eldritch_1.png", self._scale_factor), self._scale_factor],
-            "ELDRITCH_2": [load_template(f"assets/templates{res_str}/eldritch/eldritch_2.png", self._scale_factor), self._scale_factor],
-            "ELDRITCH_3": [load_template(f"assets/templates{res_str}/eldritch/eldritch_3.png", self._scale_factor), self._scale_factor],
-            "ELDRITCH_4": [load_template(f"assets/templates{res_str}/eldritch/eldritch_4.png", self._scale_factor), self._scale_factor],
-            # Templates for nodes to Shenk (from Eldritch)
-            "SHENK_0": [load_template(f"assets/templates{res_str}/shenk/shenk_0.png", self._scale_factor), self._scale_factor],
-            "SHENK_1": [load_template(f"assets/templates{res_str}/shenk/shenk_1.png", self._scale_factor), self._scale_factor],
-            "SHENK_2": [load_template(f"assets/templates{res_str}/shenk/shenk_2.png", self._scale_factor), self._scale_factor],
-            "SHENK_3": [load_template(f"assets/templates{res_str}/shenk/shenk_3.png", self._scale_factor), self._scale_factor],
-            "SHENK_4": [load_template(f"assets/templates{res_str}/shenk/shenk_4.png", self._scale_factor), self._scale_factor],
-            "SHENK_6": [load_template(f"assets/templates{res_str}/shenk/shenk_6.png", self._scale_factor), self._scale_factor],
-            "SHENK_7": [load_template(f"assets/templates{res_str}/shenk/shenk_7.png", self._scale_factor), self._scale_factor],
-            "SHENK_8": [load_template(f"assets/templates{res_str}/shenk/shenk_8.png", self._scale_factor), self._scale_factor],
-            "SHENK_9": [load_template(f"assets/templates{res_str}/shenk/shenk_9.png", self._scale_factor), self._scale_factor],
-            "SHENK_10": [load_template(f"assets/templates{res_str}/shenk/shenk_10.png", self._scale_factor), self._scale_factor],
-            "SHENK_11": [load_template(f"assets/templates{res_str}/shenk/shenk_11.png", self._scale_factor), self._scale_factor],
-            "SHENK_12": [load_template(f"assets/templates{res_str}/shenk/shenk_12.png", self._scale_factor), self._scale_factor],
-            "SHENK_13": [load_template(f"assets/templates{res_str}/shenk/shenk_13.png", self._scale_factor), self._scale_factor],
-            "SHENK_15": [load_template(f"assets/templates{res_str}/shenk/shenk_15.png", self._scale_factor), self._scale_factor],
-            "SHENK_16": [load_template(f"assets/templates{res_str}/shenk/shenk_16.png", self._scale_factor), self._scale_factor],
-            # Template Selectables
-            "A5_STASH": [load_template(f"assets/templates{res_str}/a5_stash.png", self._scale_factor), self._scale_factor],
-            "A5_WP": [load_template(f"assets/templates{res_str}/a5_wp.png", self._scale_factor), self._scale_factor],
-            "A5_RED_PORTAL": [load_template(f"assets/templates{res_str}/a5_red_portal.png", self._scale_factor), self._scale_factor],
-            "A5_RED_PORTAL_TEXT": [load_template(f"assets/templates{res_str}/a5_red_portal_with_text.png", self._scale_factor), self._scale_factor],
-            "BLUE_PORTAL": [load_template(f"assets/templates{res_str}/blue_portal.png", self._scale_factor), self._scale_factor],
-            "BLUE_PORTAL_2": [load_template(f"assets/templates{res_str}/blue_portal_2.png", self._scale_factor), self._scale_factor],
-            # Template Inventory / UI
-            "INVENTORY_GOLD_BTN": [load_template(f"assets/templates{res_str}/inventory_gold_btn.png", 1.0), 1.0],
-            "D2_LOGO_HS": [load_template(f"assets/templates{res_str}/d2_logo_hs.png", 1.0), 1.0],
-            "LOADING": [load_template(f"assets/templates{res_str}/loading.png", 1.0), 1.0],
-            "PLAY_BTN": [load_template(f"assets/templates{res_str}/play_btn.png", 1.0), 1.0],
-            "PLAY_BTN_GRAY": [load_template(f"assets/templates{res_str}/play_btn_gray.png", 1.0), 1.0],
-            "NORMAL_BTN": [load_template(f"assets/templates{res_str}/normal_btn.png", 1.0), 1.0],
-            "NIGHTMARE_BTN": [load_template(f"assets/templates{res_str}/nightmare_btn.png", 1.0), 1.0],
-            "HELL_BTN": [load_template(f"assets/templates{res_str}/hell_btn.png", 1.0), 1.0],
-            "SAVE_AND_EXIT_NO_HIGHLIGHT": [load_template(f"assets/templates{res_str}/save_and_exit_no_highlight.png", 1.0), 1.0],
-            "SAVE_AND_EXIT_HIGHLIGHT": [load_template(f"assets/templates{res_str}/save_and_exit_highlight.png", 1.0), 1.0],
-            "SERVER_ISSUES": [load_template(f"assets/templates{res_str}/server_issues.png", 1.0), 1.0],
-            "WAYPOINT_MENU": [load_template(f"assets/templates{res_str}/waypoint_menu.png", 1.0), 1.0],
-            "MERC": [load_template(f"assets/templates{res_str}/merc.png", 1.0), 1.0],
-            "TELE_ACTIVE": [load_template(f"assets/templates{res_str}/tele_active.png", 1.0), 1.0],
-            "TELE_INACTIVE": [load_template(f"assets/templates{res_str}/tele_inactive.png", 1.0), 1.0],
-            "REPAIR_BTN": [load_template(f"assets/templates{res_str}/repair_btn.png", 1.0), 1.0],
-            "TP_TOMB": [load_template(f"assets/templates{res_str}/tp_tomb.png", 1.0), 1.0],
-            "SUPER_HEALING_POTION": [load_template(f"assets/templates{res_str}/super_healing_potion.png", 1.0), 1.0],
-            "SUPER_MANA_POTION": [load_template(f"assets/templates{res_str}/super_mana_potion.png", 1.0), 1.0],
-            # NPC: Qual-Kehk
-            "QUAL_FRONT": [load_template(f"assets/npc{res_str}/qual_kehk/qual_front.png", 1.0), 1.0],
-            "QUAL_SIDE": [load_template(f"assets/npc{res_str}/qual_kehk/qual_side.png", 1.0), 1.0],
-            "QUAL_BACK": [load_template(f"assets/npc{res_str}/qual_kehk/qual_back.png", 1.0), 1.0],
-            "QUAL_45": [load_template(f"assets/npc{res_str}/qual_kehk/qual_45.png", 1.0), 1.0],
-            "QUAL_45_2": [load_template(f"assets/npc{res_str}/qual_kehk/qual_45_2.png", 1.0), 1.0],
-            "QUAL_45_3": [load_template(f"assets/npc{res_str}/qual_kehk/qual_45_3.png", 1.0), 1.0],
-            "QUAL_NAME_TAG_WHITE": [load_template(f"assets/npc{res_str}/qual_kehk/qual_kehk_white.png", 1.0), 1.0],
-            "QUAL_NAME_TAG_GOLD": [load_template(f"assets/npc{res_str}/qual_kehk/qual_kehk_gold.png", 1.0), 1.0],
-            "QUAL_RESURRECT_BTN": [load_template(f"assets/npc{res_str}/qual_kehk/resurrect_btn.png", 1.0), 1.0],
-            # NPC: Malah
-            "MALAH_FRONT": [load_template(f"assets/npc{res_str}/malah/malah_front.png", 1.0), 1.0],
-            "MALAH_BACK": [load_template(f"assets/npc{res_str}/malah/malah_BACK.png", 1.0), 1.0],
-            "MALAH_45": [load_template(f"assets/npc{res_str}/malah/malah_45.png", 1.0), 1.0],
-            "MALAH_SIDE": [load_template(f"assets/npc{res_str}/malah/malah_side.png", 1.0), 1.0],
-            "MALAH_SIDE_2": [load_template(f"assets/npc{res_str}/malah/malah_side_2.png", 1.0), 1.0],
-            "MALAH_NAME_TAG_WHITE": [load_template(f"assets/npc{res_str}/malah/malah_white.png", 1.0), 1.0],
-            "MALAH_NAME_TAG_GOLD": [load_template(f"assets/npc{res_str}/malah/malah_gold.png", 1.0), 1.0],
-            "MALAH_TRADE_BTN": [load_template(f"assets/npc{res_str}/malah/trade_btn.png", 1.0), 1.0],
-            # NPC: Larzuk
-            "LARZUK_FRONT": [load_template(f"assets/npc{res_str}/larzuk/larzuk_front.png", 1.0), 1.0],
-            "LARZUK_BACK": [load_template(f"assets/npc{res_str}/larzuk/larzuk_back.png", 1.0), 1.0],
-            "LARZUK_SIDE": [load_template(f"assets/npc{res_str}/larzuk/larzuk_side.png", 1.0), 1.0],
-            "LARZUK_SIDE_2": [load_template(f"assets/npc{res_str}/larzuk/larzuk_side_2.png", 1.0), 1.0],
-            "LARZUK_SIDE_3": [load_template(f"assets/npc{res_str}/larzuk/larzuk_side_3.png", 1.0), 1.0],
-            "LARZUK_NAME_TAG_WHITE": [load_template(f"assets/npc{res_str}/larzuk/larzuk_white.png", 1.0), 1.0],
-            "LARZUK_NAME_TAG_GOLD": [load_template(f"assets/npc{res_str}/larzuk/larzuk_gold.png", 1.0), 1.0],
-            "LARZUK_TRADE_REPAIR_BTN": [load_template(f"assets/npc{res_str}/larzuk/trade_repair_btn.png", 1.0), 1.0],
-            # NPC: Anya
-            "ANYA_FRONT": [load_template(f"assets/npc{res_str}/anya/anya_front.png", 1.0), 1.0],
-            "ANYA_BACK": [load_template(f"assets/npc{res_str}/anya/anya_back.png", 1.0), 1.0],
-            "ANYA_SIDE": [load_template(f"assets/npc{res_str}/anya/anya_side.png", 1.0), 1.0],
-            "ANYA_NAME_TAG_GOLD": [load_template(f"assets/npc{res_str}/anya/anya_gold.png", 1.0), 1.0],
-            "ANYA_NAME_TAG_WHITE": [load_template(f"assets/npc{res_str}/anya/anya_white.png", 1.0), 1.0],
-            "ANYA_TRADE_BTN": [load_template(f"assets/npc{res_str}/anya/trade_btn.png", 1.0), 1.0],
-        }
+@cache
+def stored_templates() -> dict[Template]:
+    paths = []
+    templates = {}
+    for path in TEMPLATE_PATHS:
+        paths += list_files_in_folder(path)
+    for file_path in paths:
+        file_name: str = os.path.basename(file_path)
+        if file_name.lower().endswith('.png'):
+            key = file_name[:-4].upper()
+            template_img = load_template(file_path)
+            templates[key] = Template(
+                name = key,
+                img_bgra = template_img,
+                img_bgr = cv2.cvtColor(template_img, cv2.COLOR_BGRA2BGR),
+                img_gray = cv2.cvtColor(template_img, cv2.COLOR_BGRA2GRAY),
+                alpha_mask = alpha_to_mask(template_img)
+            )
+    return templates
 
-    def get_template(self, key):
-        return self._templates[key][0]
+def get_template(key):
+    with templates_lock:
+        return stored_templates()[key].img_bgr
 
-    def search(
-        self, 
-        ref: Union[str, np.ndarray],
-        inp_img: np.ndarray,
-        threshold: float = None, 
-        roi: List[float] = None,
-        normalize_monitor: bool = False, 
-    ) -> Tuple[bool, Tuple[float, float]]:
-        """
-        Search for a template in an image
-        :param ref: Either key of a already loaded template or a image which is used as template
-        :param inp_img: Image in which the template will be searched
-        :param threshold: Threshold which determines if a template is found or not
-        :param roi: Region of Interest of the inp_img to restrict search area. Format [left, top, width, height]
-        :return: Returns found flag and the position as [bool, [x, y]]. If not found, position will be None. Position in image space.
-        """
-        threshold = self._config.general["template_threshold"] if threshold is None else threshold
-        if roi is None:
-            # if no roi is provided roi = full inp_img
-            roi = [0, 0, inp_img.shape[1], inp_img.shape[0]]
-        rx, ry, rw, rh = roi
-        inp_img = inp_img[ry:ry + rh, rx:rx + rw]
+def _process_template_refs(ref: str | np.ndarray | list[str]) -> list[Template]:
+    templates = []
+    if type(ref) != list:
+        ref = [ref]
+    for i in ref:
+        # if the reference is a string, then it's a reference to a named template asset
+        if type(i) == str:
+            templates.append(stored_templates()[i.upper()])
+        # if the reference is an image, append new Template class object
+        elif type(i) == np.ndarray:
+            templates.append(Template(
+                img_bgr = i,
+                img_gray = cv2.cvtColor(i, cv2.COLOR_BGR2GRAY),
+                alpha_mask = alpha_to_mask(i)
+            ))
+    return templates
 
-        if type(ref) == str:
-            template = self._templates[ref][0]
-            scale = self._templates[ref][1]
-        else:
-            template = ref
-            scale = 1.0
+def _single_template_match(template: Template, inp_img: np.ndarray = None, roi: list = None, color_match: list = None, use_grayscale: bool = False) -> TemplateMatch:
+    inp_img = inp_img if inp_img is not None else grab()
+    template_match = TemplateMatch()
 
-        img: np.ndarray = cv2.resize(inp_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
-        rx *= scale
-        ry *= scale
-        rw *= scale
-        rh *= scale
+    # crop image to roi
+    if roi is None:
+        # if no roi is provided roi = full inp_img
+        roi = [0, 0, inp_img.shape[1], inp_img.shape[0]]
+    rx, ry, rw, rh = roi
+    img = inp_img[ry:ry + rh, rx:rx + rw]
 
-        if img.shape[0] > template.shape[0] and img.shape[1] > template.shape[1]:
-            res = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_pos = cv2.minMaxLoc(res)
-            self.last_score = max_val
-            if max_val > threshold:
-                ref_point = (max_pos[0] + int(template.shape[1] * 0.5) + rx, max_pos[1] + int(template.shape[0] * 0.5) + ry)
-                ref_point = (int(ref_point[0] * (1.0 / scale)), int(ref_point[1] * (1.0 / scale)))
+    # filter for desired color or make grayscale
+    if color_match:
+        template_img,  = color_filter(template.img_bgr, color_match)[1],
+        img = color_filter(img, color_match)[1]
+    elif use_grayscale:
+        template_img = template.img_gray
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        template_img = template.img_bgr
 
-                if normalize_monitor:
-                    ref_point =  self._screen.convert_screen_to_monitor(ref_point)
+    if not (img.shape[0] > template_img.shape[0] and img.shape[1] > template_img.shape[1]):
+        Logger.error(f"Image shape and template shape are incompatible: {template.name}. Image: {img.shape}, Template: {template_img.shape}, roi: {roi}")
+    else:
+        res = cv2.matchTemplate(img, template_img, cv2.TM_CCOEFF_NORMED, mask = template.alpha_mask)
+        np.nan_to_num(res, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        _, max_val, _, max_pos = cv2.minMaxLoc(res)
 
-                return True, ref_point
-        return False, None
+        # save rectangle corresponding to matched region
+        rec_x = int((max_pos[0] + rx))
+        rec_y = int((max_pos[1] + ry))
+        rec_w = int(template_img.shape[1])
+        rec_h = int(template_img.shape[0])
+        template_match.region = [rec_x, rec_y, rec_w, rec_h]
+        template_match.region_monitor = [*convert_screen_to_monitor((rec_x, rec_y)), rec_w, rec_h]
+        template_match.center = roi_center(template_match.region)
+        template_match.center_monitor = convert_screen_to_monitor(template_match.center)
+        template_match.name = template.name
+        template_match.score = max_val
+        template_match.valid = True
 
-    def search_and_wait(
-        self,
-        ref: Union[str, List[str]],
-        roi: List[float] = None,
-        time_out: float = None,
-        threshold: float = None,
-        take_ss: bool = True
-    ) -> Tuple[bool, Tuple[float, float]]:
-        """
-        Helper function that will loop and keep searching for a template
-        :param ref: Key of template which has been loaded beforehand
-        :param time_out: After this amount of time the search will stop and it will return [False, None]
-        :param threshold: Adapt threshold for being found
-        :param take_ss: Bool value to take screenshot on timeout or not (flag must still be set in params!)
-        Rest of params same as TemplateFinder.search()
-        """
-        threshold = self._config.general["template_threshold"] if threshold is None else threshold
-        Logger.debug(f"Waiting for Template {ref}")
-        start = time.time()
-        while 1:
-            img = self._screen.grab()
-            is_loading_black_roi = np.average(img[:, 0:self._config.ui_roi["loading_left_black"][2]]) < 1.0
+    return template_match
 
-            if type(ref) is str:
-                ref = [ref]
-            for x in ref:
-                success, pos = self.search(x, img, roi=roi, threshold=threshold)
-                if success:
-                    break
-            if not is_loading_black_roi:
-                if success:
-                    return True, pos
-                elif time_out is not None and (time.time() - start) > time_out:
-                    if self._config.general["info_screenshots"] and take_ss:
-                        cv2.imwrite(f"./info_screenshots/info_wait_for_{ref}_time_out_" + time.strftime("%Y%m%d_%H%M%S") + ".png", img)
-                    return False, None
+
+def search(
+    ref: str | np.ndarray | list[str],
+    inp_img: np.ndarray,
+    threshold: float = 0.68,
+    roi: list[float] = None,
+    use_grayscale: bool = False,
+    color_match: list = False,
+    best_match: bool = False
+) -> TemplateMatch:
+    """
+    Search for a template in an image
+    :param ref: Either key of a already loaded template, list of such keys, or a image which is used as template
+    :param inp_img: Image in which the template will be searched
+    :param threshold: Threshold which determines if a template is found or not
+    :param roi: Region of Interest of the inp_img to restrict search area. Format [left, top, width, height]
+    :param use_grayscale: Use grayscale template matching for speed up
+    :param color_match: Pass a color to be used by misc.color_filter to filter both image of interest and template image (format Config().colors["color"])
+    :param best_match: If list input, will search for list of templates by best match. Default behavior is first match.
+    :return: Returns a TemplateMatch object with a valid flag
+    """
+    templates = _process_template_refs(ref)
+    matches = []
+    for template in templates:
+        match = _single_template_match(template, inp_img, roi, color_match, use_grayscale)
+        if match.score >= threshold:
+            if not best_match:
+                return match
+            else:
+                matches.append(match)
+    if matches:
+        matches = sorted(matches, key=lambda obj: obj.score, reverse=True)
+        return matches[0]
+    return TemplateMatch()
+
+
+def search_and_wait(
+    ref: str | list[str],
+    roi: list[float] = None,
+    timeout: float = 30,
+    threshold: float = 0.68,
+    use_grayscale: bool = False,
+    color_match: list = False,
+    best_match: bool = False,
+    suppress_debug: bool = False,
+) -> TemplateMatch:
+    """
+    Helper function that will loop and keep searching for a template
+    :param timeout: After this amount of time the search will stop and it will return [False, None]
+    :Other params are the same as for template_finder.search()
+    :returns a TemplateMatch object
+    """
+    if not suppress_debug:
+        Logger.debug(f"Waiting for templates: {ref}")
+    start = time.time()
+    template_match = TemplateMatch()
+    while (time_remains := time.time() - start < timeout):
+        img = grab()
+        is_loading_black_roi = np.average(img[:, 0:Config().ui_roi["loading_left_black"][2]]) < 1.0
+        if not is_loading_black_roi or "LOADING" in ref:
+            template_match = search(ref, img, roi=roi, threshold=threshold, use_grayscale=use_grayscale, color_match=color_match, best_match=best_match)
+            if template_match.valid:
+                break
+    if not time_remains:
+        Logger.debug(f"Could not find desired templates")
+    else:
+        Logger.debug(f"Found match: {template_match.name} ({template_match.score*100:.1f}% confidence)")
+    return template_match
+
+
+def search_all(
+    ref: str | np.ndarray | list[str],
+    inp_img: np.ndarray,
+    threshold: float = 0.68,
+    roi: list[float] = None,
+    use_grayscale: bool = False,
+    color_match: list = False,
+) -> list[TemplateMatch]:
+    """
+    Returns a list of all templates scoring above set threshold on the screen
+    :Other params are the same as for template_finder.search()
+    :return: Returns a list of TemplateMatch objects
+    """
+    templates = _process_template_refs(ref)
+    matches = []
+    img = inp_img.copy()
+    while True:
+        any_found = False
+        for template in templates:
+            match = _single_template_match(template, img, roi, color_match, use_grayscale)
+            if (ind_found := match.score >= threshold):
+                matches.append(match)
+                img = mask_by_roi(img, match.region, "inverse")
+                any_found |= ind_found
+        if not any_found:
+            break
+    return matches
 
 
 # Testing: Have whatever you want to find on the screen
 if __name__ == "__main__":
-    from screen import Screen
-    from config import Config
-    config = Config()
-    screen = Screen(config.general["monitor"])
-    template_finder = TemplateFinder(screen)
-    search_templates = ["ELDRITCH_4", "ELDRITCH_3", "ELDRITCH_2", "ELDRITCH_1"]
-    scores = {}
+    import keyboard
+    import os
+    from screen import start_detecting_window, stop_detecting_window
+    from utils.misc import wait
+    import template_finder
+    start_detecting_window()
+    wait(0.1)
+
+    print("\n== Hotkeys ==")
+    print("F11: Start")
+    print("F12: Exit")
+    print("Down arrow: decrease template matching threshold")
+    print("Up arrow: increase template matching threshold")
+    print("Left arrow: decrease template index")
+    print("Right arrow: increase template index")
+    print("F9: toggle all vs. individual template(s)")
+    print("F10: save visible template(s)")
+
+    keyboard.add_hotkey('f12', lambda: Logger.info('Force Exit (f12)') or stop_detecting_window() or os._exit(1))
+    keyboard.wait("f11")
+
+    # enter the template names you are trying to detect here
+
+    _template_list = ["SHENK_0","SHENK_1","SHENK_10","SHENK_11","SHENK_12","SHENK_13","SHENK_15","SHENK_16","SHENK_17","SHENK_18","SHENK_19","SHENK_2","SHENK_20","SHENK_3","SHENK_4","SHENK_6","SHENK_7","SHENK_8","SHENK_9","SHENK_DEATH_0","SHENK_DEATH_1","SHENK_DEATH_2","SHENK_DEATH_3","SHENK_DEATH_4","SHENK_V2_3","SHENK_V2_4","SHENK_V2_6","SHENK_V2_7","SHENK_V2_8"]
+
+    _template_list += ["ELDRITCH_0","ELDRITCH_0_V2","ELDRITCH_0_V3","ELDRITCH_1","ELDRITCH_1_V2","ELDRITCH_2","ELDRITCH_2_V2","ELDRITCH_3","ELDRITCH_4","ELDRITCH_5","ELDRITCH_6","ELDRITCH_7","ELDRITCH_7_V2","ELDRITCH_8","ELDRITCH_8_V2","ELDRITCH_9","ELDRITCH_START","ELDRITCH_START_V2"]
+
+    _current_template_idx = -1
+    _last_stored_idx = 0
+    _current_threshold = 0.6
+    _visible_templates = []
+
+    def _save_visible_templates():
+        os.makedirs("log/screenshots/info", exist_ok=True)
+        for match in _visible_templates:
+            cv2.imwrite(match['filename'], match['img'])
+            Logger.info(f"{match['filename']} saved")
+
+    def _toggle_templates():
+        global _current_template_idx
+        _current_template_idx = -1 if _current_template_idx != -1 else _last_stored_idx
+        if _current_template_idx == -1:
+            Logger.info(f"Searching for templates: {_template_list}")
+        else:
+            Logger.info(f"Searching for template: {_template_list[_current_template_idx]}")
+
+    def _incr_template_idx(direction: int = 1):
+        global _current_template_idx, _last_stored_idx
+        if \
+            (-1 < _current_template_idx < len(_template_list) - 1) or \
+            (_current_template_idx == -1 and direction > 0) or \
+            (_current_template_idx  == len(_template_list) - 1 and direction < 0):
+            _current_template_idx += direction
+            _last_stored_idx = _current_template_idx
+        if _current_template_idx == -1:
+            Logger.info(f"Searching for templates: {_template_list}")
+        else:
+            Logger.info(f"Searching for template: {_template_list[_current_template_idx]}")
+
+    def _incr_threshold(direction: int = 1):
+        global _current_threshold
+        if (_current_threshold < 1 and direction > 0) or (_current_threshold > 0 and direction < 0):
+            _current_threshold = round(_current_threshold + direction, 2)
+        Logger.info(f"_current_threshold = {_current_threshold}")
+
+    keyboard.add_hotkey('down', lambda: _incr_threshold(-0.05))
+    keyboard.add_hotkey('up', lambda: _incr_threshold(0.05))
+    keyboard.add_hotkey('left', lambda: _incr_template_idx(-1))
+    keyboard.add_hotkey('right', lambda: _incr_template_idx(1))
+    keyboard.add_hotkey('f9', lambda: _toggle_templates())
+    keyboard.add_hotkey('f10', lambda: _save_visible_templates())
+
     while 1:
-        # img = cv2.imread("")
-        img = screen.grab()
+        _visible_templates = []
+        img = grab()
         display_img = img.copy()
-        for template_name in search_templates:
-            success, pos = template_finder.search(template_name, img)
-            scores[template_name] = template_finder.last_score
-            if success:
-                cv2.putText(display_img, str(template_name), pos, cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.circle(display_img, pos, 7, (255, 0, 0), thickness=5)
-        display_img = cv2.resize(display_img, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_NEAREST)
-        print(scores)
+        if _current_template_idx < 0:
+            templates = _template_list
+        else:
+            templates = [_template_list[_current_template_idx]]
+        for key in templates:
+            template_match = template_finder.search(key, img, threshold=_current_threshold)
+            if template_match.valid:
+                x, y = template_match.center
+                cv2.putText(display_img, str(template_match.name), template_match.center, cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.circle(display_img, template_match.center, 7, (255, 0, 0), thickness=5)
+                cv2.rectangle(display_img, template_match.region[:2], (template_match.region[0] + template_match.region[2], template_match.region[1] + template_match.region[3]), (0, 0, 255), 1)
+                print(f"Name: {template_match.name} Pos: {template_match.center}, Dist: {625-x, 360-y}, Score: {template_match.score}")
+                match = {
+                    'filename': f"./log/screenshots/info/{key.lower()}.png",
+                    'img': cut_roi(img, template_match.region)
+                }
+                _visible_templates.append(match)
         cv2.imshow('test', display_img)
-        key = cv2.waitKey(1)
+        key = cv2.waitKey(3000)

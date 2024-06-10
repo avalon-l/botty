@@ -1,115 +1,205 @@
 from transitions import Machine
 import time
-from char.hammerdin import Hammerdin
-from template_finder import TemplateFinder
-from item_finder import ItemFinder
-from screen import Screen
-from ui_manager import UiManager
-from pather import Pather, Location
-from logger import Logger
-from char.sorceress import Sorceress
-from char.i_char import IChar
-from config import Config
-from health_manager import HealthManager
-from death_manager import DeathManager
-from npc_manager import NpcManager, Npc
-from pickit import PickIt
-from utils.misc import kill_thread, wait
 import keyboard
-import threading
 import time
 import os
 import random
+import cv2
+import math
+from copy import copy
+from collections import OrderedDict
 
+from health_manager import set_pause_state
+from transmute import Transmute
+from utils.misc import wait, hms
+from utils.restart import safe_exit, restart_game
+from game_stats import GameStats
+from logger import Logger
+from config import Config
+from screen import grab
+import template_finder
+from char import IChar
+from item.pickit import PickIt
+from item import consumables
+from pather import Pather, Location
+from char.sorceress import LightSorc, BlizzSorc, NovaSorc,HydraSorc
+from char.trapsin import Trapsin
+from char.paladin.hammerdin import Hammerdin
+from char.paladin import FoHdin
+from char.barbarian import Barbarian
+from char.necro import Necro
+from char.poison_necro import Poison_Necro
+from char.bone_necro import Bone_Necro
+from char.basic import Basic
+from char.basic_ranged import Basic_Ranged
+from ui_manager import wait_until_hidden, wait_until_visible, ScreenObjects, is_visible, detect_screen_object
+from ui import meters, skills, view, character_select, main_menu
+from inventory import personal, vendor, belt, common
+
+from run import Pindle, ShenkEld, Trav, Nihlathak, Arcane, Diablo
+from town import TownManager, A1, A2, A3, A4, A5, town_manager
+
+from messages import Messenger
 
 class Bot:
-    def __init__(self):
-        self._config = Config()
-        self._screen = Screen(self._config.general["monitor"])
-        self._template_finder = TemplateFinder(self._screen)
-        self._item_finder = ItemFinder()
-        self._ui_manager = UiManager(self._screen, self._template_finder)
-        self._pather = Pather(self._screen, self._template_finder)
-        self._health_manager = HealthManager(self._screen, self._template_finder, self._ui_manager)
-        self._death_manager = DeathManager(self._screen, self._template_finder)
-        self._npc_manager = NpcManager(self._screen, self._template_finder)
-        self._pickit = PickIt(self._screen, self._item_finder, self._ui_manager)
-        if self._config.char["type"] == "sorceress":
-            self._char: IChar = Sorceress(self._config.sorceress, self._config.char, self._screen, self._template_finder, self._ui_manager, self._pather)
-        elif self._config.char["type"] == "hammerdin":
-            self._char: IChar = Hammerdin(self._config.hammerdin, self._config.char, self._screen, self._template_finder, self._ui_manager, self._pather)
-        else:
-            Logger.error(f'{self._config.char["type"]} is not supported! Closing down bot.')
-            os._exit(1)
-        self._route_config = self._config.routes
-        if self._route_config["run_shenk"] and not self._route_config["run_eldritch"]:
-            Logger.error("Running shenk without eldtritch is not supported. Either run none, both or eldritch only.")
-            os._exit(1)
+
+    def __init__(self, game_stats: GameStats):
+        self._game_stats = game_stats
+        self._messenger = Messenger()
+        self._pather = Pather()
+        self._pickit = PickIt()
+
+        # Create Character
+        match Config().char["type"]:
+            case "sorceress" | "light_sorc":
+                self._char: IChar = LightSorc(Config().light_sorc, self._pather)
+            case "blizz_sorc":
+                self._char: IChar = BlizzSorc(Config().blizz_sorc, self._pather)
+            case "nova_sorc":
+                self._char: IChar = NovaSorc(Config().nova_sorc, self._pather)
+            case "hydra_sorc":
+                self._char: IChar = HydraSorc(Config().hydra_sorc, self._pather)
+            case "hammerdin" | "paladin":
+                self._char: IChar = Hammerdin(Config().hammerdin, self._pather, self._pickit) #pickit added for diablo
+            case "fohdin":
+                self._char: IChar = FoHdin(Config().fohdin, self._pather, self._pickit) #pickit added for diablo
+            case "trapsin":
+                self._char: IChar = Trapsin(Config().trapsin, self._pather)
+            case "barbarian":
+                self._char: IChar = Barbarian(Config().barbarian, self._pather)
+            case "poison_necro":
+                self._char: IChar = Poison_Necro(Config().poison_necro, self._pather)
+            case "bone_necro":
+                self._char: IChar = Bone_Necro(Config().bone_necro, self._pather)
+            case "necro":
+                self._char: IChar = Necro(Config().necro, self._pather)
+            case "basic":
+                self._char: IChar = Basic(Config().basic, self._pather)
+            case "basic_ranged":
+                self._char: IChar = Basic_Ranged(Config().basic_ranged, self._pather)
+            case _:
+                Logger.error(f'{Config().char["type"]} is not supported! Closing down bot.')
+                os._exit(1)
+
+        # Create Town Manager
+        a5 = A5(self._pather, self._char)
+        a4 = A4(self._pather, self._char)
+        a3 = A3(self._pather, self._char)
+        a2 = A2(self._pather, self._char)
+        a1 = A1(self._pather, self._char)
+        self._town_manager = TownManager(a1, a2, a3, a4, a5)
+
+        # Create runs
         self._do_runs = {
-            "run_pindle": self._route_config["run_pindle"],
-            "run_shenk": self._route_config["run_shenk"] or self._route_config["run_eldritch"],
+            "run_trav": Config().routes.get("run_trav"),
+            "run_pindle": Config().routes.get("run_pindle"),
+            "run_shenk": Config().routes.get("run_eldritch") or Config().routes.get("run_eldritch_shenk"),
+            "run_nihlathak": Config().routes.get("run_nihlathak"),
+            "run_arcane": Config().routes.get("run_arcane"),
+            "run_diablo": Config().routes.get("run_diablo"),
         }
-        if self._config.general["randomize_runs"]:
+        # Adapt order to the config
+        self._do_runs = OrderedDict((k, self._do_runs[k]) for k in Config().routes_order if k in self._do_runs and self._do_runs[k])
+
+        runs = list(self._do_runs.keys())
+        self._do_runs_reset = copy(self._do_runs)
+        Logger.info(f"Doing runs: {self._do_runs_reset.keys()}")
+        if Config().general["randomize_runs"]:
             self.shuffle_runs()
+        self._pindle = Pindle(self._pather, self._town_manager, self._char, self._pickit, runs)
+        self._shenk = ShenkEld(self._pather, self._town_manager, self._char, self._pickit, runs)
+        self._trav = Trav(self._pather, self._town_manager, self._char, self._pickit, runs)
+        self._nihlathak = Nihlathak(self._pather, self._town_manager, self._char, self._pickit, runs)
+        self._arcane = Arcane(self._pather, self._town_manager, self._char, self._pickit, runs)
+        self._diablo = Diablo(self._pather, self._town_manager, self._char, self._pickit, runs)
+
+        # Create member variables
         self._picked_up_items = False
-        self._tp_is_up = False
-        self._curr_location: Location = None
-        self._timer = None
-        self._tps_left = 20
-        self._pre_buffed = 0
+        self._curr_loc: bool | Location = None
+        self._use_id_tome = True
+        self._use_keys = True
+        self._pre_buffed = False
         self._stopping = False
         self._pausing = False
         self._current_threads = []
+        self._ran_no_pickup = False
+        self._previous_run_failed = False
+        self._timer = time.time()
 
-        self._states=['hero_selection', 'a5_town', 'pindle', 'shenk']
+        # Create State Machine
+        self._states=['initialization','hero_selection', 'town', 'pindle', 'shenk', 'trav', 'nihlathak', 'arcane', 'diablo']
         self._transitions = [
-            { 'trigger': 'create_game', 'source': 'hero_selection', 'dest': 'a5_town', 'before': "on_create_game"},
+            { 'trigger': 'init', 'source': 'initialization', 'dest': '=','before': "on_init"},
+            { 'trigger': 'select_character', 'source': 'initialization', 'dest': 'hero_selection', 'before': "on_select_character"},
+            { 'trigger': 'start_from_town', 'source': ['initialization', 'hero_selection'], 'dest': 'town', 'before': "on_start_from_town"},
+            { 'trigger': 'create_game', 'source': 'hero_selection', 'dest': '=', 'before': "on_create_game"},
             # Tasks within town
-            { 'trigger': 'maintenance', 'source': 'a5_town', 'dest': 'a5_town', 'before': "on_maintenance"},
+            { 'trigger': 'maintenance', 'source': 'town', 'dest': 'town', 'before': "on_maintenance"},
             # Different runs
-            { 'trigger': 'run_pindle', 'source': 'a5_town', 'dest': 'pindle', 'before': "on_run_pindle"},
-            { 'trigger': 'run_shenk', 'source': 'a5_town', 'dest': 'shenk', 'before': "on_run_shenk"},
+            { 'trigger': 'run_pindle', 'source': 'town', 'dest': 'pindle', 'before': "on_run_pindle"},
+            { 'trigger': 'run_shenk', 'source': 'town', 'dest': 'shenk', 'before': "on_run_shenk"},
+            { 'trigger': 'run_trav', 'source': 'town', 'dest': 'trav', 'before': "on_run_trav"},
+            { 'trigger': 'run_nihlathak', 'source': 'town', 'dest': 'nihlathak', 'before': "on_run_nihlathak"},
+            { 'trigger': 'run_arcane', 'source': 'town', 'dest': 'arcane', 'before': "on_run_arcane"},
+            { 'trigger': 'run_diablo', 'source': 'town', 'dest': 'nihlathak', 'before': "on_run_diablo"},
             # End run / game
-            { 'trigger': 'end_run', 'source': ['shenk', 'pindle'], 'dest': 'a5_town', 'before': "on_end_run"},
-            { 'trigger': 'end_game', 'source': ['a5_town', 'shenk', 'pindle', 'end_run'], 'dest': 'hero_selection', 'before': "on_end_game"},
+            { 'trigger': 'end_run', 'source': ['shenk', 'pindle', 'nihlathak', 'trav', 'arcane', 'diablo'], 'dest': 'town', 'before': "on_end_run"},
+            { 'trigger': 'end_game', 'source': ['town', 'shenk', 'pindle', 'nihlathak', 'trav', 'arcane', 'diablo','end_run'], 'dest': 'initialization', 'before': "on_end_game"},
         ]
-        self.machine = Machine(model=self, states=self._states, initial="hero_selection", transitions=self._transitions, queued=True)
+        self.machine = Machine(model=self, states=self._states, initial="initialization", transitions=self._transitions, queued=True)
+        self._transmute = Transmute(self._game_stats)
+
 
     def draw_graph(self):
         # Draw the whole graph, graphviz binaries must be installed and added to path for this!
         from transitions.extensions import GraphMachine
-        self.machine = GraphMachine(model=self, states=self._states, initial="hero_selection", transitions=self._transitions, queued=True)
+        self.machine = GraphMachine(model=self, states=self._states, initial="initialization", transitions=self._transitions, queued=True)
         self.machine.get_graph().draw('my_state_diagram.png', prog='dot')
 
+    def get_curr_location(self):
+        return self._curr_loc
+
     def start(self):
-        self.trigger('create_game')
+        self.trigger_or_stop('init')
 
     def stop(self):
         self._stopping = True
-        for t in self._current_threads:
-            kill_thread(t)
 
     def toggle_pause(self):
         self._pausing = not self._pausing
-        Logger.info(f"Pause at next state change...") if self._pausing else Logger.info(f"Resume")
-
-    def trigger_or_stop(self, name: str):
         if self._pausing:
-            Logger.info(f"{self._config.general['name']} is now pausing")
+            Logger.info(f"Pause at next state change...")
+        else:
+            Logger.info(f"Resume")
+            self._game_stats.resume_timer()
+
+    def trigger_or_stop(self, name: str, **kwargs):
+        if self._pausing:
+            Logger.info(f"{Config().general['name']} is now pausing")
+            self._game_stats.pause_timer()
         while self._pausing:
             time.sleep(0.2)
         if not self._stopping:
-            self.trigger(name)
+            self.trigger(name, **kwargs)
+
+    def restart_or_exit(self, message: str =""):
+        if message:
+            Logger.error(message)
+        if Config().general["restart_d2r_when_stuck"]:
+            Logger.info("Restart botty")
+            restart_game(Config().general["d2r_path"], Config().advanced_options["launch_options"])
+            self.stop()
+        else:
+            Logger.info("Shut down botty")
+            safe_exit()
 
     def current_game_length(self):
-        if self._timer is None:
-            return 0
-        return time.time() - self._timer
+        return self._game_stats.get_current_game_length()
 
     def shuffle_runs(self):
         tmp = list(self._do_runs.items())
         random.shuffle(tmp)
-        self._do_runs = dict(tmp)
+        self._do_runs = OrderedDict(tmp)
 
     def is_last_run(self):
         found_unfinished_run = False
@@ -119,93 +209,203 @@ class Bot:
                 break
         return not found_unfinished_run
 
+    def _rebuild_as_asset_to_trigger(trigger_to_assets: dict):
+        result = {}
+        for key in trigger_to_assets.keys():
+            for asset in trigger_to_assets[key]:
+                result[asset] = key
+        return result
+
+    def on_init(self):
+        self._game_stats.log_start_game()
+        keyboard.release(Config().char["stand_still"])
+        transition_to_screens = Bot._rebuild_as_asset_to_trigger({
+            "select_character": main_menu.MAIN_MENU_MARKERS,
+            "start_from_town": town_manager.TOWN_MARKERS,
+        })
+        if (match := template_finder.search_and_wait(list(transition_to_screens.keys()), best_match=True)).valid:
+            self.trigger_or_stop(transition_to_screens[match.name])
+        else:
+            self.restart_or_exit(f"Failed to detect {list(transition_to_screens.keys())}.")
+
+    def on_select_character(self):
+        # Make sure the correct char is selected
+        if not character_select.has_char_template_saved():
+            character_select.save_char_online_status()
+            character_select.save_char_template()
+        else:
+            if not character_select.select_char():
+                if Config().general["info_screenshots"]:
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    cv2.imwrite("./log/screenshots/info/info_failed_character_select_" + timestamp + ".png", grab())
+                    if character_select.has_char_template_saved():
+                        saved_char_img = character_select.get_saved_char_template()
+                        cv2.imwrite("./log/screenshots/info/info_failed_character_select_saved_template_" + timestamp + ".png", saved_char_img)
+                self.restart_or_exit(f"Character select failed.")
+        self.trigger_or_stop("create_game")
+
     def on_create_game(self):
-        if self._timer is not None:
-            delay = self._config.general["min_game_length_s"] - (time.time() - self._timer)
-            if delay > 0.5:
-                Logger.info(f"Delay game creation for {delay:.2f} s")
-                wait(delay, delay + 5.0)
-        Logger.info("Start new game")
-        self._timer = time.time()
-        self._template_finder.search_and_wait("D2_LOGO_HS")
-        self._ui_manager.start_game()
-        self._template_finder.search_and_wait(["A5_TOWN_1", "A5_TOWN_0"])
-        self._tp_is_up = False
-        self._curr_location = Location.A5_TOWN_START
-        # Make sure these keys are released
-        keyboard.release(self._config.char["stand_still"])
-        wait(0.05, 0.15)
-        keyboard.release(self._config.char["show_items"])
+        # Start a game from hero selection
+        if (m := wait_until_visible(ScreenObjects.MainMenu)).valid:
+            if "DARK" in m.name:
+                keyboard.send("esc")
+            main_menu.start_game()
+            view.move_to_corpse()
+        else:
+            self.restart_or_exit()
+        self.trigger_or_stop("start_from_town")
+
+    def on_start_from_town(self):
+        self._curr_loc = self._town_manager.wait_for_town_spawn()
+
+        # Handle picking up corpse in case of death
+        if (corpse_present := is_visible(ScreenObjects.Corpse)):
+            self._previous_run_failed = True
+            view.pickup_corpse()
+            wait_until_hidden(ScreenObjects.Corpse)
+            belt.fill_up_belt_from_inventory(Config().char["num_loot_columns"])
+        self._char.discover_capabilities()
+        if corpse_present and self._char.capabilities.can_teleport_with_charges and not self._char.select_tp():
+            keybind = Config().char["teleport"]
+            Logger.info(f"Teleport keybind is lost upon death. Rebinding teleport to '{keybind}'")
+            self._char.remap_right_skill_hotkey("TELE_ACTIVE", Config().char["teleport"])
+
+        # Run /nopickup command to avoid picking up stuff on accident
+        if Config().char["enable_no_pickup"] and (not self._ran_no_pickup and not self._game_stats._nopickup_active):
+            self._ran_no_pickup = True
+            if view.enable_no_pickup():
+                self._game_stats._nopickup_active = True
+                Logger.info("Activated /nopickup")
+            else:
+                Logger.error("Failed to detect if /nopickup command was applied or not")
+
+        self._game_stats.log_exp()
+
         self.trigger_or_stop("maintenance")
 
     def on_maintenance(self):
-        if self._death_manager.died() or self._health_manager.did_chicken():
-            time.sleep(0.6)
-            # Also do this for did_chicken because we can not be 100% sure that chicken did not press esc before
-            # the death manager could determine if we were dead
-            self._death_manager.pick_up_corpse()
-            # TODO: maybe it is time for a special BeltManager?
-            wait(1.2, 1.5)
-            self._ui_manager.fill_up_belt_from_inventory(self._config.char["num_loot_columns"])
+        # Pause health manager if not already paused
+        set_pause_state(True)
 
-        # Check if healing is needed, TODO: add shoping e.g. for potions
-        img = self._screen.grab()
-        # TODO: If tp is up we always go back into the portal...
-        if not self._tp_is_up and (self._health_manager.get_health(img) < 0.6 or self._health_manager.get_mana(img) < 0.3):
-            Logger.info("Need some healing first. Go talk to Malah")
-            if not self._pather.traverse_nodes(self._curr_location, Location.MALAH, self._char): 
-                self.trigger_or_stop("end_game")
-                return
-            self._curr_location = Location.MALAH
-            self._npc_manager.open_npc_menu(Npc.MALAH)
-            if not self._pather.traverse_nodes(self._curr_location, Location.A5_TOWN_START, self._char):
-                self.trigger_or_stop("end_game")
-                return
-            self._curr_location = Location.A5_TOWN_START
+        # Dismiss skill/quest/help/stats icon if they are on screen
+        if not view.dismiss_skills_icon():
+            view.return_to_play()
+
+        # Look at belt to figure out how many pots need to be picked up
+        belt.update_pot_needs()
+
+        # Inspect inventory
+        items = None
+        need_inspect = self._picked_up_items or self._previous_run_failed
+        if Config().char["runs_per_stash"]:
+            need_inspect |= (self._game_stats._run_counter - 1) % Config().char["runs_per_stash"] == 0
+        if need_inspect:
+            img = personal.open()
+            # Update TP, ID, key needs
+            if self._game_stats._game_counter == 1:
+                self._use_id_tome = common.tome_state(img, 'id')[0] is not None
+                self._use_keys = is_visible(ScreenObjects.Key, img)
+            if (self._game_stats._run_counter - 1) % 4 == 0 or self._previous_run_failed:
+                personal.update_tome_key_needs(img, item_type = 'tp')
+                if self._use_id_tome:
+                    personal.update_tome_key_needs(img, item_type = 'id')
+                if self._use_keys:
+                    # if keys run out then refilling will be unreliable :(
+                    self._use_keys = personal.update_tome_key_needs(img, item_type = 'key')
+            # Check inventory items
+            if personal.inventory_has_items(img):
+                Logger.debug("Inspecting inventory items")
+                items = personal.inspect_items(img, game_stats=self._game_stats, close_window=False)
+        common.close()
+        Logger.debug(f"Needs: {consumables.get_needs()}")
+        if items:
+            # if there are still items that need identifying, go to cain to identify them
+            if any([item.need_id for item in items]):
+                Logger.info("ID items at cain")
+                self._curr_loc = self._town_manager.identify(self._curr_loc)
+                if not self._curr_loc:
+                    return self.trigger_or_stop("end_game", failed=True)
+                # recheck inventory
+                items = personal.inspect_items(game_stats=self._game_stats)
+        keep_items = any([item.keep for item in items]) if items else None
+        sell_items = any([item.sell for item in items]) if items else None
+        stash_gold = personal.get_inventory_gold_full()
+
+        # Check if should need some healing
+        img = grab()
+        need_refill = (
+            consumables.should_buy("health", min_needed = 3) or
+            consumables.should_buy("mana", min_needed = 3) or
+            (self._use_keys and consumables.should_buy("key", min_remaining = 4)) or
+            consumables.should_buy("tp", min_remaining = 3) or
+            consumables.should_buy("id", min_remaining = 3)
+        )
+        if need_refill or sell_items:
+            Logger.info("Buy consumables and/or sell items")
+            self._curr_loc, result_items = self._town_manager.buy_consumables(self._curr_loc, items = items)
+            if self._curr_loc:
+                items = result_items
+                sell_items = any([item.sell for item in items]) if items else None
+                Logger.debug(f"Needs: {consumables.get_needs()}")
+        elif meters.get_health(img) < 0.6 or meters.get_mana(img) < 0.2:
+            Logger.info("Healing at next possible Vendor")
+            self._curr_loc = self._town_manager.heal(self._curr_loc)
+        if not self._curr_loc:
+            return self.trigger_or_stop("end_game", failed=True)
 
         # Stash stuff
-        if self._picked_up_items:
-            Logger.info("Stashing picked up items")
-            if not self._pather.traverse_nodes(self._curr_location, Location.A5_STASH, self._char):
-                self.trigger_or_stop("end_game")
-                return
-            self._curr_location = Location.A5_STASH
-            time.sleep(0.3)
-            if self._char.select_by_template("A5_STASH"):
-                self._ui_manager.stash_all_items(self._config.char["num_loot_columns"])
-                self._picked_up_items = False
-                time.sleep(1.2) # otherwise next grab of screen will still have inventory
-            else:
-                Logger.warning("Could not find stash, continue...")
+        if keep_items or stash_gold:
+            Logger.info("Stashing items")
+            self._curr_loc, result_items = self._town_manager.stash(self._curr_loc, items=items)
+            sell_items = any([item.sell for item in result_items]) if result_items else None
+            Logger.info("Running transmutes")
+            self._transmute.run_transmutes(force=False)
+            common.close()
+            if not self._curr_loc:
+                return self.trigger_or_stop("end_game", failed=True)
+            self._picked_up_items = False
 
-        if self._tps_left < 4:
-            Logger.info("Repairing and buying tps at Lazurk")
-            if not self._pather.traverse_nodes(self._curr_location, Location.LARZUK, self._char):
-                self.trigger_or_stop("end_game")
-                return
-            self._curr_location = Location.LARZUK
-            self._npc_manager.open_npc_menu(Npc.LARZUK)
-            self._npc_manager.press_npc_btn(Npc.LARZUK, "trade_repair")
-            if self._ui_manager.repair_and_fill_up_tp():
-                wait(0.1, 0.2)
-                self._ui_manager.close_vendor_screen()
-                self._tps_left = 20
-            wait(0.5)
+        # Check if we are out of tps or need repairing
+        need_repair = is_visible(ScreenObjects.NeedRepair)
+        need_routine_repair = False if not Config().char["runs_per_repair"] else self._game_stats._run_counter % Config().char["runs_per_repair"] == 0
+        need_refill_teleport = self._char.capabilities.can_teleport_with_charges and (not self._char.select_tp() or self._char.is_low_on_teleport_charges())
+        if need_repair or need_routine_repair or need_refill_teleport or sell_items:
+            if need_repair:
+                Logger.info("Repair needed. Gear is about to break")
+            elif need_routine_repair:
+                Logger.info(f"Routine repair. Run count={self._game_stats._run_counter}, runs_per_repair={Config().char['runs_per_repair']}")
+            elif need_refill_teleport:
+                Logger.info("Teleport charges ran out. Need to repair")
+            elif sell_items:
+                Logger.info("Selling items at repair vendor")
+            self._curr_loc, result_items = self._town_manager.repair(self._curr_loc, items)
+            if self._curr_loc:
+                items = result_items
+            if not self._curr_loc:
+                return self.trigger_or_stop("end_game", failed=True)
 
         # Check if merc needs to be revived
-        merc_alive, _ = self._template_finder.search("MERC", self._screen.grab(), threshold=0.9, roi=[0, 0, 200, 200])
-        if not merc_alive:
-            Logger.info("Reviveing merc")
-            if not self._pather.traverse_nodes(self._curr_location, Location.QUAL_KEHK, self._char):
-                self.trigger_or_stop("end_game")
-                return
-            self._curr_location = Location.QUAL_KEHK
-            if self._npc_manager.open_npc_menu(Npc.QUAL_KEHK):
-                self._npc_manager.press_npc_btn(Npc.QUAL_KEHK, "resurrect")
-            time.sleep(1.2)
+        if not is_visible(ScreenObjects.MercIcon) and Config().char["use_merc"]:
+            Logger.info("Resurrect merc")
+            self._game_stats.log_merc_death()
+            self._curr_loc = self._town_manager.resurrect(self._curr_loc)
+            if not self._curr_loc:
+                return self.trigger_or_stop("end_game", failed=True)
+
+        # Gamble if needed
+        while vendor.get_gamble_status() and Config().char["gamble_items"]:
+            Logger.debug("Head to gamble")
+            self._curr_loc = self._town_manager.gamble(self._curr_loc)
+            items = vendor.gamble()
+            if items:
+                self._curr_loc, _ = self._town_manager.stash(self._curr_loc, items = items)
+                common.close()
+            if not self._curr_loc:
+                return self.trigger_or_stop("end_game", failed=True)
 
         # Start a new run
         started_run = False
+        self._previous_run_failed = False
         for key in self._do_runs:
             if self._do_runs[key]:
                 self.trigger_or_stop(key)
@@ -214,185 +414,131 @@ class Bot:
         if not started_run:
             self.trigger_or_stop("end_game")
 
-    def _start_run(self, key, run):
-        self._do_runs[key] = False
-        run_thread = threading.Thread(target=run.doit, args=(self,))
-        run_thread.start()
-        self._current_threads.append(run_thread)
-        # Set up monitoring
-        health_monitor_thread = threading.Thread(target=self._health_manager.start_monitor, args=(run_thread,))
-        health_monitor_thread.start()
-        self._current_threads.append(health_monitor_thread)
-        death_monitor_thread = threading.Thread(target=self._death_manager.start_monitor, args=(run_thread,))
-        death_monitor_thread.start()
-        self._current_threads.append(death_monitor_thread)
-        run_thread.join()
-        # Run done, lets stop health monitoring and death monitoring
-        self._health_manager.stop_monitor()
-        health_monitor_thread.join()
-        if self._health_manager.did_chicken():
-            # in case of chicken give the death manager some time to pick up on possible death flag
-            # since death monitor does not check with the same frequency to save on runtime
-            wait(self._death_manager.get_loop_delay() + 1.0)
-        self._death_manager.stop_monitor()
-        death_monitor_thread.join()
+    def on_end_game(self, failed: bool = False):
+        if Config().general["info_screenshots"] and failed:
+            cv2.imwrite("./log/screenshots/info/info_failed_game_" + time.strftime("%Y%m%d_%H%M%S") + ".png", grab())
+        self._curr_loc = False
+        self._pre_buffed = False
+        view.save_and_exit()
+        set_pause_state(True)
+        self._game_stats.log_end_game(failed=failed)
 
-        self._current_threads = []
-        if self._death_manager.died() or self._health_manager.did_chicken() or self.is_last_run() or not run.success:
-            self.trigger_or_stop("end_game")
+        if Config().general["max_runtime_before_break_m"] and Config().general["break_length_m"]:
+            elapsed_time = time.time() - self._timer
+            Logger.debug(f'Session length = {math.ceil(elapsed_time/60)} minutes, max_runtime_before_break_m {Config().general["max_runtime_before_break_m"]}.')
+
+            if elapsed_time > (Config().general["max_runtime_before_break_m"]*60):
+                break_msg = f'Ran for {hms(elapsed_time)}, taking a break for {hms(Config().general["break_length_m"]*60)}.'
+                Logger.info(break_msg)
+                if self._messenger.enabled:
+                    self._messenger.send_message(break_msg)
+                if not self._pausing:
+                    self.toggle_pause()
+
+                wait(Config().general["break_length_m"]*60)
+
+                break_msg = f'Break over, will now run for {hms(Config().general["max_runtime_before_break_m"]*60)}.'
+                Logger.info(break_msg)
+                if self._messenger.enabled:
+                    self._messenger.send_message(break_msg)
+                if self._pausing:
+                    self.toggle_pause()
+
+                self._timer = time.time()
+
+
+        self._do_runs = copy(self._do_runs_reset)
+        if Config().general["randomize_runs"]:
+            self.shuffle_runs()
+        self.trigger_or_stop("init")
+
+    def on_end_run(self):
+        if not Config().char["pre_buff_every_run"]:
+            self._pre_buffed = True
+        success = self._char.tp_town()
+        if success:
+            self._curr_loc = self._town_manager.wait_for_tp(self._curr_loc)
+            if self._curr_loc:
+                set_pause_state(True)
+                return self.trigger_or_stop("maintenance")
+        if not skills.has_tps():
+            consumables.set_needs("tp", 20)
+        set_pause_state(True)
+        self.trigger_or_stop("end_game", failed=True)
+
+    # All the runs go here
+    # ==================================
+    def _ending_run_helper(self, res: bool | tuple[Location, bool]):
+        self._game_stats._run_counter += 1
+        self._game_stats.log_exp()
+        # either fill member variables with result data or mark run as failed
+        failed_run = True
+        if res:
+            failed_run = False
+            self._curr_loc, self._picked_up_items = res
+        # in case its the last run or the run was failed, end game, otherwise move to next run
+        if self.is_last_run() or failed_run:
+            if failed_run:
+                self._previous_run_failed = True
+            self.trigger_or_stop("end_game", failed=failed_run)
         else:
             self.trigger_or_stop("end_run")
 
     def on_run_pindle(self):
-        class RunPindle:
-            def __init__(self):
-                self.success = False
-            def doit(self, bot: Bot):
-                Logger.info("Run Pindle")
-                self.success = bot._pather.traverse_nodes(bot._curr_location, Location.NIHLATHAK_PORTAL, bot._char)
-                if not self.success:
-                    return
-                bot._curr_location = Location.NIHLATHAK_PORTAL
-                wait(0.2, 0.4)
-                self.success &= bot._char.select_by_template("A5_RED_PORTAL")
-                time.sleep(0.5)
-                self.success &= bot._template_finder.search_and_wait(["PINDLE_0", "PINDLE_1"], threshold=0.65, time_out=20)[0]
-                if not self.success:
-                    return
-                if not bot._pre_buffed:
-                    bot._char.pre_buff()
-                    bot._pre_buffed = 1
-                wait(0.2, 0.3)
-                if bot._config.char["static_path_pindle"]:
-                    bot._pather.traverse_nodes_fixed("pindle_save_dist", bot._char)
-                else:
-                    bot._pather.traverse_nodes(Location.PINDLE_START, Location.PINDLE_SAVE_DIST, bot._char)
-                bot._char.kill_pindle()
-                wait(1.5, 1.8)
-                bot._picked_up_items = bot._pickit.pick_up_items(bot._char)
-                # in order to move away for items to have a clear tp, move to the end of the hall
-                if not bot.is_last_run():
-                    bot._pather.traverse_nodes_fixed("pindle_save_tp", bot._char)
-                wait(0.2, 0.3)
-                self.success = True
-                return
-        run = RunPindle()
-        self._start_run("run_pindle", run)
+        res = False
+        self._do_runs["run_pindle"] = False
+        self._game_stats.update_location("Pin")
+        self._curr_loc = self._pindle.approach(self._curr_loc)
+        if self._curr_loc:
+            set_pause_state(False)
+            res = self._pindle.battle(not self._pre_buffed)
+        self._ending_run_helper(res)
 
     def on_run_shenk(self):
-        class RunShenk:
-            def __init__(self):
-                self.success = False
-            def doit(self, bot: Bot):
-                Logger.info("Run Eldritch")
-                self.success = bot._pather.traverse_nodes(bot._curr_location, Location.A5_WP, bot._char)
-                if not self.success:
-                    return
-                bot._curr_location = Location.A5_WP
-                wait(0.6)
-                bot._char.select_by_template("A5_WP")
-                wait(1.0)
-                bot._ui_manager.use_wp(4, 1)
-                time.sleep(0.5)
-                self.success = bot._template_finder.search_and_wait(["ELDRITCH_0", "ELDRITCH_START"], threshold=0.65, time_out=20)[0]
-                if not self.success:
-                    return
-                if not bot._pre_buffed:
-                    bot._char.pre_buff()
-                    bot._pre_buffed = 1
-                wait(0.2, 0.3)
-                # eldritch
-                if bot._config.char["static_path_eldritch"]:
-                    bot._pather.traverse_nodes_fixed("eldritch_save_dist", bot._char)
-                else:
-                    bot._pather.traverse_nodes(Location.ELDRITCH_START, Location.ELDRITCH_SAVE_DIST, bot._char)
-                bot._char.kill_eldritch()
-                wait(0.4)
-                bot._picked_up_items = bot._pickit.pick_up_items(bot._char)
-                if not bot.is_last_run() and not bot._route_config["run_shenk"]:
-                    bot._pather.traverse_nodes_fixed("eldritch_save_tp", bot._char)
-                # shenk
-                if bot._route_config["run_shenk"]:
-                    Logger.info("Run Shenk")
-                    self.success = bot._pather.traverse_nodes(Location.SHENK_START, Location.SHENK_SAVE_DIST, bot._char)
-                    if not self.success:
-                        return
-                    wait(0.15, 0.2)
-                    bot._char.kill_shenk()
-                    wait(1.9, 2.4)
-                    bot._picked_up_items |= bot._pickit.pick_up_items(bot._char)
-                    # in order to move away for items to have a clear tp, move to the end of the hall
-                    if not bot.is_last_run():
-                        bot._pather.traverse_nodes_fixed("shenk_save_tp", bot._char)
-                wait(0.5, 0.6)
-                self.success = True
-                return
-        run = RunShenk()
-        self._start_run("run_shenk", run)
+        res = False
+        self._do_runs["run_shenk"] = False
+        self._curr_loc = self._shenk.approach(self._curr_loc)
+        if self._curr_loc:
+            set_pause_state(False)
+            res = self._shenk.battle(Config().routes.get("run_eldritch_shenk"), not self._pre_buffed, self._game_stats)
+        self._ending_run_helper(res)
 
-    def on_end_game(self):
-        self._pre_buffed = 0
-        if self._health_manager.did_chicken() or self._death_manager.died():
-            Logger.info("End game while chicken or death happened. Checking where we are at.")
-            # This is a tricky state as we send different actions in different threads.
-            # Chicken could have been succesfull which means we are at hero selection screen
-            # Chicken could have been unsuccesfull, which means we are naked in a5_town
-            # Chicken could have been unsuccesfull, but it already stopped main thread and death manager did not have time to check death -> death screen
-            time.sleep(1.5)
-            is_loading = True
-            while is_loading:
-                is_loading = self._template_finder.search("LOADING", self._screen.grab())[0]
-                time.sleep(0.5)
-            time.sleep(1.5)
-            # Okay we are sure we are not in loading screen, let's check if we are in hero selection or in a5 town
-            img = self._screen.grab()
-            if self._template_finder.search("A5_TOWN_1", img)[0]:
-                Logger.info("We are at town, save and exit game.")
-                self._ui_manager.save_and_exit()
-            elif self._template_finder.search("D2_LOGO_HS", img)[0]:
-                Logger.info("We are at hero selection.")
-            elif self._death_manager.handle_death_screen():
-                Logger.info("For some reason we were still at death screen, but Death Manager should have sent us back to town. save and exit game.")
-                self._ui_manager.save_and_exit()
-            else:
-                Logger.error("Could not determine location after chicken / death. Can not continue...")
-                os._exit(1)
-        else:
-            self._ui_manager.save_and_exit()
+    def on_run_trav(self):
+        res = False
+        self._do_runs["run_trav"] = False
+        self._game_stats.update_location("Trav")
+        self._curr_loc = self._trav.approach(self._curr_loc)
+        if self._curr_loc:
+            set_pause_state(False)
+            res = self._trav.battle(not self._pre_buffed)
+        self._ending_run_helper(res)
 
-        if self._timer is not None:
-            elapsed_time = time.time() - self._timer
-            Logger.info(f"End game. Elapsed time: {elapsed_time:.2f}s")
-        self._do_runs = {
-            "run_pindle": self._route_config["run_pindle"],
-            "run_shenk": self._route_config["run_shenk"] or self._route_config["run_eldritch"]
-        }
-        if self._config.general["randomize_runs"]:
-            self.shuffle_runs()
-        wait(0.2, 0.5)
-        self.trigger_or_stop("create_game")
+    def on_run_nihlathak(self):
+        res = False
+        self._do_runs["run_nihlathak"] = False
+        self._game_stats.update_location("Nihl")
+        self._curr_loc = self._nihlathak.approach(self._curr_loc)
+        if self._curr_loc:
+            set_pause_state(False)
+            res = self._nihlathak.battle(not self._pre_buffed)
+        self._ending_run_helper(res)
 
-    def on_end_run(self):
-        success = self._char.tp_town()
-        self._tps_left -= 1
-        if success:
-            success, _= self._template_finder.search_and_wait(["A5_TOWN_1", "A5_TOWN_0"], time_out=10)
-            if success:
-                self._tp_is_up = True
-                self._curr_location = Location.A5_TOWN_START
-                self.trigger_or_stop("maintenance")
-            else:
-                self.trigger_or_stop("end_game")
-        else:
-            self._tps_left = 0
-            self.trigger_or_stop("end_game")
+    def on_run_arcane(self):
+        res = False
+        self._do_runs["run_arcane"] = False
+        self._game_stats.update_location("Arc")
+        self._curr_loc = self._arcane.approach(self._curr_loc)
+        if self._curr_loc:
+            set_pause_state(False)
+            res = self._arcane.battle(not self._pre_buffed)
+        self._ending_run_helper(res)
 
-
-if __name__ == "__main__":
-    import keyboard
-    keyboard.add_hotkey("f12", lambda: os._exit(1))
-    keyboard.wait("f11")
-    bot = Bot()
-    bot.state = "a5_town"
-    bot._curr_location = Location.A5_TOWN_START
-    bot.on_maintenance()
+    def on_run_diablo(self):
+        res = False
+        self._do_runs["run_diablo"] = False
+        self._game_stats.update_location("Dia")
+        self._curr_loc = self._diablo.approach(self._curr_loc)
+        if self._curr_loc:
+            set_pause_state(False)
+            res = self._diablo.battle(not self._pre_buffed)
+        self._ending_run_helper(res)

@@ -1,38 +1,54 @@
-from death_manager import DeathManager
-from screen import Screen
-from template_finder import TemplateFinder
 from config import Config
 from death_manager import DeathManager
-from ui_manager import UiManager
-import keyboard
 import time
-
+import keyboard
+from ui_manager import ScreenObjects, is_visible
+from ui import view, loading
+from utils.misc import set_d2r_always_on_top
 
 class GameRecovery:
-    def __init__(self):
-        self._config = Config()
-        self._screen = Screen(self._config.general["monitor"])
-        self._template_finder = TemplateFinder(self._screen)
-        self._death_manager = DeathManager(self._screen, self._template_finder)
-        self._ui_manager = UiManager(self._screen, self._template_finder)
+    def __init__(self, death_manager: DeathManager):
+        self._death_manager = death_manager
 
     def go_to_hero_selection(self):
-        # first lets just see if you might already be at hero selection
-        found, _ = self._template_finder.search_and_wait("D2_LOGO_HS", time_out=1, take_ss=False)
-        if found:
-            return True
-        # would have been too easy, maybe we have died?
-        died = self._death_manager.handle_death_screen()
-        if died:
-            return self._ui_manager.save_and_exit()
-        # we must be ingame, but maybe we are at vendor or on stash, press "esc" until we find a save and exit btn (max 5 times)
-        for _ in range(5):
-            keyboard.press("esc")
-            time.sleep(1)
-            templates = ["SAVE_AND_EXIT_NO_HIGHLIGHT","SAVE_AND_EXIT_HIGHLIGHT"]
-            found, _ = self._template_finder.search_and_wait(templates, roi=self._config.ui_roi["save_and_exit"], time_out=1.5, take_ss=False)
-            if found:
-                keyboard.press("esc")
+        set_d2r_always_on_top()
+        time.sleep(1)
+        # clean up key presses that might be pressed in the run_thread
+        keyboard.release(Config().char["stand_still"])
+        time.sleep(0.1)
+        keyboard.release(Config().char["show_items"])
+        start = time.time()
+        while (time.time() - start) < 30:
+            # make sure we are not on loading screen
+            is_loading = loading.check_for_black_screen()
+            while is_loading:
+                is_loading = is_visible(ScreenObjects.Loading)
+                is_loading |= loading.check_for_black_screen()
+                time.sleep(0.5)
+            # lets just see if you might already be at hero selection
+            if is_visible(ScreenObjects.MainMenu):
+                return True
+            # would have been too easy, maybe we have died?
+            if self._death_manager.handle_death_screen():
                 time.sleep(1)
-                return self._ui_manager.save_and_exit()
+                continue
+            # check for save/exit button
+            if is_visible(ScreenObjects.SaveAndExit):
+                view.save_and_exit()
+                continue
+            # maybe we are in-game in stash/inventory, press escape
+            elif is_visible(ScreenObjects.InGame):
+                keyboard.send("esc")
+            time.sleep(1)
         return False
+
+
+if __name__ == "__main__":
+    from death_manager import DeathManager
+    import keyboard
+    import os
+    keyboard.add_hotkey('f12', lambda: os._exit(1))
+    keyboard.wait("f11")
+    death_manager = DeathManager()
+    game_recovery = GameRecovery(death_manager)
+    print(game_recovery.go_to_hero_selection())
